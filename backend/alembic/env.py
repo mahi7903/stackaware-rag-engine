@@ -6,8 +6,8 @@ from sqlalchemy import pool
 from alembic import context
 
 from app.database import Base
-import app.models.document  # important so model gets registered
-
+import app.models.document  # important to get model registered
+import app.models.user #import for user 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
 config = context.config

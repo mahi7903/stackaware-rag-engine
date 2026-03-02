@@ -1,0 +1,27 @@
+# Main entry point for the FastAPI backend.
+# I start with a small health endpoint and gradually add real features
+# like authentication and RAG APIs as the project evolves.
+
+from fastapi import FastAPI, Depends, HTTPException, status
+from sqlalchemy.orm import Session
+
+from app.database.db import get_db
+from app.models.user import User
+from app.schemas.schemas import UserRegister, UserResponse
+from app.auth.security import hash_password
+from app.routers.users import router as users_router
+
+from app.routers import stack #slug
+
+app = FastAPI(title="StackAware RAG Engine")
+
+
+app.include_router(users_router, prefix="/auth", tags=["auth"]) #route for the user.py file
+app.include_router(stack.router, prefix="/stack", tags=["stack"]) #route for the item slugs 
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
