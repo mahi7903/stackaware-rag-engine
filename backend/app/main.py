@@ -12,13 +12,15 @@ from app.auth.security import hash_password
 from app.routers.users import router as users_router
 
 from app.routers import stack #slug
+from app.routers import stack_tools #for endpoints like id, query history , and document upload
+
 
 app = FastAPI(title="StackAware RAG Engine")
 
 
 app.include_router(users_router, prefix="/auth", tags=["auth"]) #route for the user.py file
 app.include_router(stack.router, prefix="/stack", tags=["stack"]) #route for the item slugs 
-
+app.include_router(stack_tools.router, prefix="/stack")
 
 @app.get("/health")
 def health():

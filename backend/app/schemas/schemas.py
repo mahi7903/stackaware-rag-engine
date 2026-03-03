@@ -55,3 +55,8 @@ class TechItemOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+#shema for /stack/context route from the user_stack_items as a relational source of truth 
+class StackContextOut(BaseModel):
+    stack: list[StackItemOut]
