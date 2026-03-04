@@ -17,12 +17,26 @@ from app.models.query_log import QueryLog
 from uuid import uuid4
 from pypdf import PdfReader
 from docx import Document as DocxDocument
-
+from app.models.document import Document
 from app.models.uploaded_file import UploadedFile
+
+#imports for version uploads documents
+import re
+from app.models.document_version import DocumentVersion
+# for SHA256 and skip reembedding hashlib import 
+import hashlib
 
 router = APIRouter(tags=["Stack Tools"])
 
-
+#helper for documents upload version
+def _make_doc_key(original_filename: str) -> str:
+    """
+    Intent: turn a filename into a stable doc_key (same logical document across versions).
+    This is deliberately simple + predictable for v1, so we don't break existing flows.
+    """
+    base = os.path.splitext(original_filename)[0].strip().lower()
+    base = re.sub(r"[^a-z0-9]+", "-", base)
+    return base.strip("-") or "document"
 
 # Small helpers (kept local on purpose)
 
@@ -193,7 +207,6 @@ def rag_history_filtered(
     ]
 
 
-
 # 3) POST /stack/documents/upload  (upload + ingest into documents table)
 @router.post("/documents/upload")
 async def upload_document_and_ingest(
@@ -217,6 +230,10 @@ async def upload_document_and_ingest(
     - saves original file to backend/app/data/uploads/
     - logs upload metadata in uploaded_files table
     - extracts text -> chunk -> embed -> store in documents
+
+    Versioning upgrade :
+    - creates/updates a row in document_versions
+    - links every stored document chunk to document_versions.id via documents.document_version_id
     """
     filename = (file.filename or "").strip()
     if not filename:
@@ -228,8 +245,34 @@ async def upload_document_and_ingest(
         raise HTTPException(status_code=400, detail="Only .txt, .md, .pdf, .docx are supported")
 
     raw_bytes = await file.read()
+    
     if not raw_bytes:
         raise HTTPException(status_code=400, detail="Uploaded file is empty")
+    content_hash = hashlib.sha256(raw_bytes).hexdigest()
+    doc_key = _make_doc_key(filename)
+
+#  DUPLICATE CHECK GOES RIGHT HERE (before saving to disk)
+    existing_active = (
+        db.query(DocumentVersion)
+        .join(UploadedFile, UploadedFile.id == DocumentVersion.upload_id)
+        .filter(
+            DocumentVersion.doc_key == doc_key,
+            DocumentVersion.is_active == True,  # noqa: E712
+            UploadedFile.content_hash == content_hash,
+        )
+        .order_by(DocumentVersion.version.desc())
+        .first()
+    )
+
+    if existing_active:
+        return {
+            "message": "Duplicate upload (same content). Using existing active version.",
+            "doc_key": doc_key,
+            "upload_id": existing_active.upload_id,
+            "document_version_id": existing_active.id,
+            "version": existing_active.version,
+            "note": "No file saved. No DB rows created. No embeddings regenerated.",
+        }
 
     # 1) Save file to disk (admin-controlled storage)
     uploads_dir = Path(__file__).resolve().parents[1] / "data" / "uploads"
@@ -274,62 +317,113 @@ async def upload_document_and_ingest(
         raise HTTPException(status_code=400, detail="No readable text found in the uploaded document")
 
     # 3) Log upload metadata in uploaded_files table
-    upload_row = UploadedFile(
-        original_filename=filename,
-        stored_filename=stored_filename,
-        content_type=file.content_type,
-        size_bytes=len(raw_bytes),
-        title=doc_title,
-        source=doc_source,
-        storage_path=str(saved_path),
-        uploaded_by_user_id=None,  # later we can fill this from auth
-    )
-    db.add(upload_row)
-    db.commit()
-    db.refresh(upload_row)
-
-    # 4) Chunk + embed + insert into documents
+    # 4) Chunk first (no DB changes yet)
     chunks = _chunk_text(text_data, chunk_size=chunk_size, overlap=overlap)
     if not chunks:
         raise HTTPException(status_code=400, detail="No usable chunks created from extracted text")
 
+    # 5) Build embeddings first (still no DB changes)
+    # Intent: compute embeddings before we touch version state.
+    # If OpenAI fails, we never deactivate/delete the old version.
     client, embed_model = _env_openai_client()
-
-    insert_sql = text(
-        """
-        INSERT INTO documents (title, source, chunk_index, chunk_count, content, embedding)
-        VALUES (:title, :source, :chunk_index, :chunk_count, :content, (:embedding)::vector(1536));
-        """
-    )
-
     try:
-        chunk_count = len(chunks)
-
-        for i, chunk in enumerate(chunks):
+        vec_literals: list[str] = []
+        for chunk in chunks:
             emb = client.embeddings.create(model=embed_model, input=chunk).data[0].embedding
-            vec_literal = _to_pgvector_literal(emb)
+            vec_literals.append(_to_pgvector_literal(emb))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Embedding failed: {e}")
 
-            db.execute(
-                insert_sql,
-                {
-                    "title": doc_title,
-                    "source": doc_source,
-                    "chunk_index": i,
-                    "chunk_count": chunk_count,
-                    "content": chunk,
-                    "embedding": vec_literal,
-                },
+    insert_sql = text("""
+        INSERT INTO documents
+            (title, source, chunk_index, chunk_count, content, embedding, document_version_id)
+        VALUES
+            (:title, :source, :chunk_index, :chunk_count, :content, (:embedding)::vector(1536), :document_version_id);
+    """)
+
+    # 6) ATOMIC DB transaction: upload_row + version flip + delete old chunks + insert new chunks
+    try:
+        # Intent: one all-or-nothing operation.
+        # If anything fails below, old version remains active and its chunks remain intact.
+        with db.begin():
+
+            # 6.1) Log upload metadata
+            upload_row = UploadedFile(
+                original_filename=filename,
+                stored_filename=stored_filename,
+                content_type=file.content_type,
+                size_bytes=len(raw_bytes),
+                title=doc_title,
+                source=doc_source,
+                storage_path=str(saved_path),
+                uploaded_by_user_id=None,  # later we can fill this from auth
+                content_hash=content_hash,
+            )
+            db.add(upload_row)
+            db.flush()  # gives upload_row.id without committing
+
+            # 6.2) Find current active version (if any)
+            active = (
+                db.query(DocumentVersion)
+                .filter(
+                    DocumentVersion.doc_key == doc_key,
+                    DocumentVersion.is_active == True,  # noqa: E712
+                )
+                .order_by(DocumentVersion.version.desc())
+                .first()
             )
 
-        db.commit()
+            next_version = 1
+            if active:
+                next_version = active.version + 1
+
+                # deactivate old version
+                active.is_active = False
+
+                # remove old embeddings/chunks (so only latest remains stored)
+                db.query(Document).filter(
+                    Document.document_version_id == active.id
+                ).delete()
+
+            # 6.3) Create new version row
+            new_version = DocumentVersion(
+                doc_key=doc_key,
+                version=next_version,
+                upload_id=upload_row.id,
+                is_active=True,
+                meta={"original_filename": filename},
+            )
+            db.add(new_version)
+            db.flush()  # gives new_version.id without committing
+
+            # 6.4) Insert chunks for the new version
+            chunk_count = len(chunks)
+            for i, chunk in enumerate(chunks):
+                db.execute(
+                    insert_sql,
+                    {
+                        "title": doc_title,
+                        "source": doc_source,
+                        "chunk_index": i,
+                        "chunk_count": chunk_count,
+                        "content": chunk,
+                        "embedding": vec_literals[i],
+                        "document_version_id": new_version.id,
+                    },
+                )
+
+        # leaving the 'with db.begin()' block commits automatically
 
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Document ingest failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Upload ingest failed: {e}")
 
     return {
         "message": "Upload + ingest successful",
         "upload_id": upload_row.id,
+        "document_version_id": new_version.id,
+        "doc_key": doc_key,
+        "version": next_version,
         "original_filename": filename,
         "stored_filename": stored_filename,
         "saved_to": str(saved_path),
@@ -337,3 +431,44 @@ async def upload_document_and_ingest(
         "source": doc_source,
         "chunks_ingested": len(chunks),
     }
+
+#to get all the uploaded documentslist 
+@router.get("/documents")
+def list_ingested_documents(
+    db: Session = Depends(get_db),
+):
+    """
+    Intent: Admin-only inventory view of what's currently indexed for RAG.
+    We return only ACTIVE versions, because that's what retrieval uses.
+    """
+    rows = db.execute(text("""
+        SELECT
+            dv.doc_key,
+            dv.version,
+            dv.created_at,
+            uf.original_filename,
+            uf.stored_filename,
+            uf.uploaded_at,
+            COUNT(d.id) AS chunk_count
+        FROM document_versions dv
+        JOIN uploaded_files uf ON uf.id = dv.upload_id
+        LEFT JOIN documents d ON d.document_version_id = dv.id
+        WHERE dv.is_active = true
+        GROUP BY
+            dv.doc_key, dv.version, dv.created_at,
+            uf.original_filename, uf.stored_filename, uf.uploaded_at
+        ORDER BY dv.created_at DESC;
+    """)).mappings().all()
+
+    return [
+        {
+            "doc_key": r["doc_key"],
+            "version": r["version"],
+            "chunk_count": int(r["chunk_count"] or 0),
+            "original_filename": r["original_filename"],
+            "stored_filename": r["stored_filename"],
+            "uploaded_at": r["uploaded_at"].isoformat() if r["uploaded_at"] else None,
+            "version_created_at": r["created_at"].isoformat() if r["created_at"] else None,
+        }
+        for r in rows
+    ]

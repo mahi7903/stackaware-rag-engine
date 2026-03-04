@@ -27,18 +27,21 @@ def main() -> None:
     # Convert Python list[float] -> pgvector literal string
     vec_literal = "[" + ",".join(f"{x:.10f}" for x in qvec) + "]"
 
-    sql = text(
-        """
-        SELECT id, title, source, chunk_index, chunk_count,
-               (embedding <-> (:qvec)::vector(1536)) AS l2_distance,
-               LEFT(content, 140) AS preview
-        FROM documents
-        WHERE embedding IS NOT NULL
-        ORDER BY embedding <-> (:qvec)::vector(1536)
-        LIMIT 5;
-        """
-    )
-
+    sql = text("""
+        SELECT
+            d.id,
+            d.title,
+            d.source,
+            d.content,
+            d.chunk_index,
+            d.chunk_count
+        FROM documents d
+        JOIN document_versions dv
+            ON dv.id = d.document_version_id
+        WHERE dv.is_active = true
+        ORDER BY d.embedding <-> (:query_vec)::vector(1536)
+        LIMIT :k;
+""")
     with SessionLocal() as db:
         count = db.execute(
             text("SELECT COUNT(*) FROM documents WHERE embedding IS NOT NULL;")

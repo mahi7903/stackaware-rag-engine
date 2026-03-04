@@ -2,7 +2,7 @@ from sqlalchemy import Column, Integer, Text, DateTime, BigInteger
 from sqlalchemy.sql import func
 
 from app.database.database import Base
-
+from sqlalchemy import Column, String
 
 class UploadedFile(Base):
     """
@@ -30,3 +30,5 @@ class UploadedFile(Base):
     uploaded_by_user_id = Column(Integer, nullable=True)
 
     uploaded_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    # Intent: store a stable hash of the file bytes so we can detect exact duplicates and skip re-embedding.
+    content_hash = Column(String(64), nullable=True, index=True)
