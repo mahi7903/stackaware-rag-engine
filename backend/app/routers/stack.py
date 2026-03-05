@@ -297,6 +297,7 @@ def rag_answer(
     q: str = Query(..., min_length=3, max_length=500),
     k: int = Query(3, ge=1, le=10),
     db: Session = Depends(get_db),  # <-- needed to write into query_logs
+    current_user = Depends(get_current_user)
 ):
     """
     Full RAG pipeline:
@@ -361,7 +362,12 @@ def rag_answer(
     if not rows:
         answer = "I couldn't find relevant context in the indexed documents."
 
-        log = QueryLog(question=q, answer=answer, sources=sources_payload)
+        log = QueryLog(
+        question=q,
+        answer=answer,
+        sources=sources_payload,
+        user_id=current_user.id,  # Intent: history becomes per-user
+    )
         db.add(log)
         db.commit()
 
@@ -397,8 +403,8 @@ Answer:
 
     answer = response.choices[0].message.content
 
-    # ✅ Always log the final output we returned
-    log = QueryLog(question=q, answer=answer, sources=sources_payload)
+    #  Always log the final output we returned
+    log = QueryLog(question=q, answer=answer, sources=sources_payload, user_id=current_user.id)
     db.add(log)
     db.commit()
 
@@ -406,6 +412,7 @@ Answer:
         "question": q,
         "answer": answer,
         "sources": sources_payload,
+        "user_id": current_user.id,  # Intent: show which user this log belongs to
     }
 
 #querry tool route for the user's search history 

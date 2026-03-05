@@ -25,6 +25,11 @@ import re
 from app.models.document_version import DocumentVersion
 # for SHA256 and skip reembedding hashlib import 
 import hashlib
+#import for the current user 
+
+from app.auth.security import get_current_user
+from app.models.user import User
+
 
 router = APIRouter(tags=["Stack Tools"])
 
@@ -104,15 +109,16 @@ def _to_pgvector_literal(vec: list[float]) -> str:
 def rag_history_by_id(
     log_id: int,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),  # Intent: user can only access their own history item
 ):
     """
-    Returns a single history record by ID.
-
-    Why this matters:
-    - frontend can show a "History list", then open details when user clicks an entry
-    - this is also super useful for debugging which sources were used on a past answer
+    Returns a single history record by ID (scoped to the current user).
     """
-    log = db.query(QueryLog).filter(QueryLog.id == log_id).first()
+    log = (
+        db.query(QueryLog)
+        .filter(QueryLog.id == log_id, QueryLog.user_id == current_user.id)
+        .first()
+    )
     if not log:
         raise HTTPException(status_code=404, detail="History item not found")
 
@@ -148,6 +154,7 @@ def rag_history_filtered(
     created_to: Optional[datetime] = Query(None),
 
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),  # Intent: each user sees only their own history
 ):
     """
     History feed for the frontend.
@@ -156,7 +163,7 @@ def rag_history_filtered(
     - global history (no user_id yet)
     - filters help you build a better UX quickly (search, tabs like "Answered" / "No context")
     """
-    q = db.query(QueryLog)
+    q = db.query(QueryLog).filter(QueryLog.user_id == current_user.id)
 
     # Text search filters
     if question_contains:
@@ -342,12 +349,13 @@ async def upload_document_and_ingest(
     """)
 
     # 6) ATOMIC DB transaction: upload_row + version flip + delete old chunks + insert new chunks
+# 6) ATOMIC DB transaction: upload_row + version flip + delete old chunks + insert new chunks
     try:
-        # Intent: one all-or-nothing operation.
-        # If anything fails below, old version remains active and its chunks remain intact.
-        with db.begin():
+    # Intent: nested transaction prevents "transaction already begun" issues
+    # when FastAPI/SQLAlchemy session already has an open transaction.
+        with db.begin_nested():
 
-            # 6.1) Log upload metadata
+        # 6.1) Log upload metadata
             upload_row = UploadedFile(
                 original_filename=filename,
                 stored_filename=stored_filename,
@@ -362,7 +370,7 @@ async def upload_document_and_ingest(
             db.add(upload_row)
             db.flush()  # gives upload_row.id without committing
 
-            # 6.2) Find current active version (if any)
+        # 6.2) Find current active version (if any)
             active = (
                 db.query(DocumentVersion)
                 .filter(
@@ -375,10 +383,9 @@ async def upload_document_and_ingest(
 
             next_version = 1
             if active:
-                next_version = active.version + 1
-
-                # deactivate old version
+            # deactivate old version
                 active.is_active = False
+                next_version = active.version + 1
 
                 # remove old embeddings/chunks (so only latest remains stored)
                 db.query(Document).filter(
@@ -396,7 +403,7 @@ async def upload_document_and_ingest(
             db.add(new_version)
             db.flush()  # gives new_version.id without committing
 
-            # 6.4) Insert chunks for the new version
+        # 6.4) Insert chunks for the new version
             chunk_count = len(chunks)
             for i, chunk in enumerate(chunks):
                 db.execute(
@@ -412,7 +419,8 @@ async def upload_document_and_ingest(
                     },
                 )
 
-        # leaving the 'with db.begin()' block commits automatically
+        # finalize the transaction (important!)
+        db.commit()
 
     except Exception as e:
         db.rollback()

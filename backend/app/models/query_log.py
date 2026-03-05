@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, Text, DateTime
+from sqlalchemy import Column, Integer, Text, DateTime, ForeignKey
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.sql import func
 
@@ -17,3 +17,5 @@ class QueryLog(Base):
     answer = Column(Text, nullable=False)
     sources = Column(JSONB, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    # Intent: store which user asked the question so history can be per-user.
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
