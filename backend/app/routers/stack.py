@@ -15,12 +15,17 @@ from app.database.database import SessionLocal
 from app.models.profile import TechItem, UserProfile, UserStackItem
 from app.models.query_log import QueryLog
 from app.models.user import User
+from app.utils.api_guards import log_info, log_error, check_rag_rate_limit
 from app.schemas.schemas import (
     StackContextOut,
     StackItemAdd,
     StackItemOut,
     TechItemOut,
 )
+
+
+
+
 router = APIRouter()
 
 
@@ -547,15 +552,40 @@ def rag_answer(
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY missing")
 
     client = OpenAI(api_key=api_key)
-
+    try:
+        check_rag_rate_limit(current_user.id)
+    except Exception as e:
+        log_error(
+            "rag_rate_limit_exceeded",
+            error=e,
+            user_id=current_user.id,
+        )
+        raise HTTPException(status_code=429, detail=str(e))
     # 1) Query embedding
     # Intent: lightly normalize the question so small typos don't weaken retrieval too much
     normalized_q = normalize_query_for_rag(db, current_user.id, q)
+    log_info(
+        "rag_answer_started",
+        user_id=current_user.id,
+        question=q,
+        normalized_query=normalized_q,
+        requested_k=k,
+    )
 
-    query_vec = client.embeddings.create(
-        model=embed_model,
-        input=normalized_q
-    ).data[0].embedding
+    try:
+        query_vec = client.embeddings.create(
+            model=embed_model,
+            input=normalized_q
+        ).data[0].embedding
+    except Exception as e:
+        log_error(
+            "rag_query_embedding_failed",
+            error=e,
+            user_id=current_user.id,
+            question=q,
+        )
+        raise HTTPException(status_code=502, detail=f"Query embedding failed: {e}")
+    
     vec_literal = "[" + ",".join(f"{x:.10f}" for x in query_vec) + "]"
 
     
@@ -582,14 +612,34 @@ def rag_answer(
 
     # NOTE: using SessionLocal here is fine for retrieval.
     # I keep it separate from `db` so we don't accidentally override the injected session.
-    with SessionLocal() as session:
-        rows = session.execute(sql, {"qvec": vec_literal, "k": k}).fetchall()
+    try:
+        with SessionLocal() as session:
+            rows = session.execute(sql, {"qvec": vec_literal, "k": k}).fetchall()
+    except Exception as e:
+        log_error(
+            "rag_retrieval_failed",
+            error=e,
+            user_id=current_user.id,
+            question=q,
+            normalized_query=normalized_q,
+            requested_k=k,
+        )
+        raise HTTPException(status_code=500, detail=f"RAG retrieval failed: {e}")
 
     # 3) Relevance guard
     # I keep this strict on purpose so the assistant does not answer from weak matches.
     if not rows:
         answer = "I couldn't find relevant context in the indexed documents."
         sources_payload = []
+
+        log_info(
+            "rag_all_rows_filtered_out",
+            user_id=current_user.id,
+            question=q,
+            normalized_query=normalized_q,
+            retrieved_count=len(rows),
+            max_distance=MAX_DISTANCE,
+        )
 
         log = QueryLog(
             question=q,
@@ -640,6 +690,15 @@ def rag_answer(
     if best_row.distance > BEST_MATCH_THRESHOLD:
         answer = "I couldn't find relevant context in the indexed documents."
         sources_payload = []
+                
+        log_info(
+            "rag_best_match_below_threshold",
+            user_id=current_user.id,
+            question=q,
+            normalized_query=normalized_q,
+            best_distance=float(best_row.distance),
+            best_match_threshold=BEST_MATCH_THRESHOLD,
+        )
 
         log = QueryLog(
             question=q,
@@ -674,6 +733,14 @@ def rag_answer(
     ]
 
     context = "\n\n---\n\n".join(r.content for r in filtered_rows)
+
+    log_info(
+        "rag_context_selected",
+        user_id=current_user.id,
+        question=q,
+        selected_chunk_count=len(filtered_rows),
+        best_distance=float(best_row.distance),
+    )
 
     # Intent: include the user's real stack context so the answer is more relevant to their setup.
     stack_context = build_stack_context_for_user(db, current_user.id)
@@ -725,13 +792,30 @@ def rag_answer(
     """
 
     # 4) Generate answer
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.2,
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+        )
+        answer = response.choices[0].message.content
+    except Exception as e:
+        log_error(
+            "rag_generation_failed",
+            error=e,
+            user_id=current_user.id,
+            question=q,
+            selected_chunk_count=len(filtered_rows),
+        )
+        raise HTTPException(status_code=502, detail=f"Answer generation failed: {e}")
+    
+    log_info(
+        "rag_answer_completed",
+        user_id=current_user.id,
+        question=q,
+        selected_chunk_count=len(filtered_rows),
+        returned_source_count=len(sources_payload),
     )
-
-    answer = response.choices[0].message.content
 
     #  Always log the final output we returned
     log = QueryLog(question=q, answer=answer, sources=sources_payload, user_id=current_user.id)

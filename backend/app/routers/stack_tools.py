@@ -29,7 +29,7 @@ import hashlib
 
 from app.auth.security import get_current_user
 from app.models.user import User
-
+from app.utils.api_guards import log_info, log_error #for the logs error info 
 
 router = APIRouter(tags=["Stack Tools"])
 
@@ -252,6 +252,11 @@ async def upload_document_and_ingest(
         raise HTTPException(status_code=400, detail="Only .txt, .md, .pdf, .docx are supported")
 
     raw_bytes = await file.read()
+    log_info(
+    "upload_started",
+    filename=file.filename,
+    size_bytes=len(raw_bytes),
+)
     
     if not raw_bytes:
         raise HTTPException(status_code=400, detail="Uploaded file is empty")
@@ -272,6 +277,14 @@ async def upload_document_and_ingest(
     )
 
     if existing_active:
+        log_info(
+            "upload_duplicate_detected",
+            filename=file.filename,
+            doc_key=doc_key,
+            content_hash=content_hash,
+            existing_version=existing_active.version,
+            existing_upload_id=existing_active.upload_id,
+        )
         return {
             "message": "Duplicate upload (same content). Using existing active version.",
             "doc_key": doc_key,
@@ -289,6 +302,13 @@ async def upload_document_and_ingest(
     stored_filename = f"{uuid4().hex}{ext}"
     saved_path = uploads_dir / stored_filename
     saved_path.write_bytes(raw_bytes)
+    log_info(
+        "upload_file_saved",
+        filename=file.filename,
+        doc_key=doc_key,
+        storage_path=str(saved_path),
+        stored_filename=stored_filename,
+    )
 
     # Pick defaults for doc metadata (what we store with chunks)
     doc_title = title or Path(filename).stem
@@ -317,6 +337,13 @@ async def upload_document_and_ingest(
             text_data = ""
 
     except Exception as e:
+        log_error(
+            "upload_text_extraction_failed",
+            error=e,
+            filename=file.filename,
+            doc_key=doc_key,
+            storage_path=str(saved_path),
+        )
         raise HTTPException(status_code=400, detail=f"Could not extract text: {e}")
 
     text_data = (text_data or "").strip()
@@ -339,6 +366,13 @@ async def upload_document_and_ingest(
             emb = client.embeddings.create(model=embed_model, input=chunk).data[0].embedding
             vec_literals.append(_to_pgvector_literal(emb))
     except Exception as e:
+        log_error(
+            "upload_embedding_failed",
+            error=e,
+            filename=file.filename,
+            doc_key=doc_key,
+            chunk_count=len(chunks),
+        )
         raise HTTPException(status_code=500, detail=f"Embedding failed: {e}")
 
     insert_sql = text("""
@@ -424,7 +458,22 @@ async def upload_document_and_ingest(
 
     except Exception as e:
         db.rollback()
+        log_error(
+            "upload_db_failed",
+            error=e,
+            filename=file.filename,
+            doc_key=doc_key,
+        )
         raise HTTPException(status_code=500, detail=f"Upload ingest failed: {e}")
+    
+    log_info(
+        "upload_completed",
+        filename=file.filename,
+        doc_key=doc_key,
+        upload_id=upload_row.id,
+        document_version_id=new_version.id,
+        chunk_count=len(chunks),
+    )
 
     return {
         "message": "Upload + ingest successful",
@@ -439,6 +488,8 @@ async def upload_document_and_ingest(
         "source": doc_source,
         "chunks_ingested": len(chunks),
     }
+
+
 
 #to get all the uploaded documentslist 
 @router.get("/documents")

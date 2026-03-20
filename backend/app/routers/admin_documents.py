@@ -11,7 +11,7 @@ from app.models.document import Document
 from app.models.document_version import DocumentVersion
 from app.models.uploaded_file import UploadedFile
 from app.routers.stack_tools import _chunk_text, _env_openai_client, _to_pgvector_literal
-
+from app.utils.api_guards import log_info, log_error
 
 
 # all admin document routes behind login so delete/read actions are not public.
@@ -338,6 +338,12 @@ def reindex_document_by_doc_key(
 
     if not active_row:
         raise HTTPException(status_code=404, detail="Active document version not found")
+    log_info(
+        "reindex_started",
+        doc_key=doc_key,
+        active_version_id=active_row.id,
+        upload_id=active_row.upload_id,
+    )
 
     if not active_row.upload_id:
         raise HTTPException(status_code=400, detail="Active version has no linked upload")
@@ -358,6 +364,11 @@ def reindex_document_by_doc_key(
 
     if not saved_path.exists():
         raise HTTPException(status_code=404, detail="Uploaded file no longer exists on disk")
+    log_info(
+        "reindex_file_found",
+        doc_key=doc_key,
+        storage_path=str(saved_path),
+    )
 
     ext = saved_path.suffix.lower()
 
@@ -384,6 +395,12 @@ def reindex_document_by_doc_key(
         else:
             raise HTTPException(status_code=400, detail="Unsupported file type for reindex")
     except Exception as e:
+        log_error(
+            "reindex_text_extraction_failed",
+            error=e,
+            doc_key=doc_key,
+            storage_path=str(saved_path),
+        )
         raise HTTPException(status_code=400, detail=f"Could not extract text for reindex: {e}")
 
     text_data = (text_data or "").strip()
@@ -402,6 +419,12 @@ def reindex_document_by_doc_key(
             emb = client.embeddings.create(model=embed_model, input=chunk).data[0].embedding
             vec_literals.append(_to_pgvector_literal(emb))
     except Exception as e:
+        log_error(
+            "reindex_embedding_failed",
+            error=e,
+            doc_key=doc_key,
+            chunk_count=len(chunks),
+        )
         raise HTTPException(status_code=500, detail=f"Embedding failed during reindex: {e}")
 
     insert_sql = text("""
@@ -442,8 +465,19 @@ def reindex_document_by_doc_key(
 
     except Exception as e:
         db.rollback()
+        log_error(
+            "reindex_db_failed",
+            error=e,
+            doc_key=doc_key,
+            active_version_id=active_row.id,
+        )
         raise HTTPException(status_code=500, detail=f"Reindex failed: {e}")
-
+    log_info(
+        "reindex_completed",
+        doc_key=doc_key,
+        active_version_id=active_row.id,
+        chunk_count=len(chunks),
+    )
     return {
         "message": "Document reindexed successfully",
         "doc_key": doc_key,

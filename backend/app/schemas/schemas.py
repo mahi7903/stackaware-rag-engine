@@ -60,3 +60,23 @@ class TechItemOut(BaseModel):
 #shema for /stack/context route from the user_stack_items as a relational source of truth 
 class StackContextOut(BaseModel):
     stack: list[StackItemOut]
+
+
+
+
+#  RAG Mode Response Schema 
+
+class RagSource(BaseModel):
+    id: int
+    title: str
+    source: str
+    chunk_index: int
+    chunk_count: int
+    distance: float
+
+
+class RagAnswerResponse(BaseModel):
+    question: str
+    answer: str
+    sources: list[RagSource]
+    user_id: int
